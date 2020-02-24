@@ -16,6 +16,7 @@ from core.evaluation import inference_on_dataset
 
 import core.trainers.hooks as hooks
 import core.utils.comm as comm
+import numpy as np
 import pickle
 import torch
 import copy
@@ -160,7 +161,7 @@ class Checkpointer:
             last_filename_basename (str): the basename of the last filename.
         """
         save_file = os.path.join(self.save_dir, "last_checkpoint")
-        with PathManager.open(save_file, "w") as f:
+        with open(save_file, "w") as f:
             f.write(last_filename_basename)
 
     def _load_file(self, f: str):
@@ -176,7 +177,7 @@ class Checkpointer:
         """
         return torch.load(f, map_location=torch.device("cpu"))
 
-    def _load_model(self, checkpoint: Any):
+    def _load_model(self, checkpoint):
         """
         Load weights from a checkpoint.
         Args:
@@ -184,11 +185,6 @@ class Checkpointer:
         """
         checkpoint_state_dict = checkpoint.pop("model")
         self._convert_ndarray_to_tensor(checkpoint_state_dict)
-
-        # if the state_dict comes from a model that was wrapped in a
-        # DataParallel or DistributedDataParallel during serialization,
-        # remove the "module" prefix before performing the matching.
-        _strip_prefix_if_present(checkpoint_state_dict, "module.")
 
         # work around https://github.com/pytorch/pytorch/issues/24139
         model_state_dict = self.model.state_dict()
@@ -210,11 +206,11 @@ class Checkpointer:
         )
         if incompatible.missing_keys:
             self.logger.info(
-                get_missing_parameters_message(incompatible.missing_keys)
+                "Missing keys: {}".format(incompatible.missing_keys)
             )
         if incompatible.unexpected_keys:
             self.logger.info(
-                get_unexpected_parameters_message(incompatible.unexpected_keys)
+                "Unexpected keys: {}".format(incompatible.unexpected_keys)
             )
 
     def _convert_ndarray_to_tensor(self, state_dict: dict):
@@ -238,6 +234,57 @@ class Checkpointer:
                 )
             if not isinstance(v, torch.Tensor):
                 state_dict[k] = torch.from_numpy(v)
+
+
+class DetectionCheckpointer(Checkpointer):
+    """
+    Same as :class:`Checkpointer`, but is able to handle models in detectron & detectron2
+    model zoo, and apply conversions for legacy models.
+    """
+
+    def __init__(self, model, save_dir="", *, save_to_disk=None, **checkpointables):
+        is_main_process = comm.is_main_process()
+        super().__init__(
+            model,
+            save_dir,
+            save_to_disk=is_main_process if save_to_disk is None else save_to_disk,
+            **checkpointables,
+        )
+
+    def _load_file(self, filename):
+        if filename.endswith(".pkl"):
+            with PathManager.open(filename, "rb") as f:
+                data = pickle.load(f, encoding="latin1")
+            if "model" in data and "__author__" in data:
+                # file is in Detectron2 model zoo format
+                self.logger.info("Reading a file from '{}'".format(data["__author__"]))
+                return data
+            else:
+                # assume file is from Caffe2 / Detectron1 model zoo
+                if "blobs" in data:
+                    # Detection models have "blobs", but ImageNet models don't
+                    data = data["blobs"]
+                data = {k: v for k, v in data.items() if not k.endswith("_momentum")}
+                return {"model": data, "__author__": "Caffe2", "matching_heuristics": True}
+
+        loaded = super()._load_file(filename)  # load native pth checkpoint
+        if "model" not in loaded:
+            loaded = {"model": loaded}
+        return loaded
+
+    def _load_model(self, checkpoint):
+        if checkpoint.get("matching_heuristics", False):
+            self._convert_ndarray_to_tensor(checkpoint["model"])
+            # convert weights by name-matching heuristics
+            model_state_dict = self.model.state_dict()
+            align_and_update_state_dicts(
+                model_state_dict,
+                checkpoint["model"],
+                c2_conversion=checkpoint.get("__author__", None) == "Caffe2",
+            )
+            checkpoint["model"] = model_state_dict
+        # for non-caffe2 models, use standard ways to load it
+        super()._load_model(checkpoint)
 
 
 class DefaultTrainer(SimpleTrainer):
