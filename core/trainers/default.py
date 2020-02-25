@@ -17,274 +17,88 @@ from core.evaluation import inference_on_dataset
 import core.trainers.hooks as hooks
 import core.utils.comm as comm
 import numpy as np
+
+import argparse
+import logging
 import pickle
 import torch
 import copy
 import os
 
-import logging
 
-
-class Checkpointer:
-
-    def __init__(self, model, save_dir="", **checkpointables):
-        '''
-        Checkpointer saves configuration, evaluation results and model parameters
-        to disk
-
-        Args:
-            model (nn.Module): Model
-            save_dir (str): Checkpoint save directory
-            checkpointables (dict): Evaluation metrics
-        '''
-        self.model = model
-        self.checkpointables = copy.copy(checkpointables)
-        self.logger = logging.getLogger(__name__)
-        self.save_dir = save_dir
-
-    def save(self, name: str, **kwargs: dict):
-        """
-        Dump model and checkpointables to a file.
-
-        Args:
-            name (str): name of the file.
-            kwargs (dict): extra arbitrary data to save.
-        """
-        if not self.save_dir:
-            return
-
-        data = {}
-        data["model"] = self.model.state_dict()
-        for key, obj in self.checkpointables.items():
-            data[key] = obj
-        data.update(kwargs)
-
-        basename = "{}.pth".format(name)
-        save_file = os.path.join(self.save_dir, basename)
-        assert os.path.basename(save_file) == basename, basename
-        self.logger.info("Saving checkpoint to {}".format(save_file))
-        with open(save_file, "wb") as f:
-            torch.save(data, f)
-        self.tag_last_checkpoint(basename)
-
-    def load(self, path: str):
-        """
-        Load from the given checkpoint. When path points to network file, this
-        function has to be called on all ranks.
-
-        Args:
-            path (str): path or url to the checkpoint. If empty, will not load
-                anything.
-        Returns:
-            dict:
-                extra data loaded from the checkpoint that has not been
-                processed. For example, those saved with
-                :meth:`.save(**extra_data)`.
-        """
-        if not path:
-            # no checkpoint provided
-            self.logger.info(
-                "No checkpoint found. Initializing model from scratch"
-            )
-            return {}
-        self.logger.info("Loading checkpoint from {}".format(path))
-
-        checkpoint = self._load_file(path)
-        self._load_model(checkpoint)
-        for key, obj in self.checkpointables.items():
-            if key in checkpoint:
-                self.logger.info("Loading {} from {}".format(key, path))
-                self.checkpointables[key] = checkpoint.pop(key)
-
-        # return any further checkpoint data
-        return checkpoint
-
-    def has_checkpoint(self):
-        """
-        Returns:
-            bool: whether a checkpoint exists in the target directory.
-        """
-        save_file = os.path.join(self.save_dir, "last_checkpoint")
-        return os.path.exists(save_file)
-
-    def get_checkpoint_file(self):
-        """
-        Returns:
-            str: The latest checkpoint file in target directory.
-        """
-        save_file = os.path.join(self.save_dir, "last_checkpoint")
-        try:
-            with open(save_file, "r") as f:
-                last_saved = f.read().strip()
-        except IOError:
-            # if file doesn't exist, maybe because it has just been
-            # deleted by a separate process
-            return ""
-        return os.path.join(self.save_dir, last_saved)
-
-    def get_all_checkpoint_files(self):
-        """
-        Returns:
-            list: All available checkpoint files (.pth files) in target
-                directory.
-        """
-        all_model_checkpoints = [
-            os.path.join(self.save_dir, file)
-            for file in os.listdir(self.save_dir)
-            if os.path.isfile(os.path.join(self.save_dir, file))
-            and file.endswith(".pth")
-        ]
-        return all_model_checkpoints
-
-    def resume_or_load(self, path: str, *, resume: bool = True):
-        """
-        If `resume` is True, this method attempts to resume from the last
-        checkpoint, if exists. Otherwise, load checkpoint from the given path.
-        This is useful when restarting an interrupted training job.
-
-        Args:
-            path (str): path to the checkpoint.
-            resume (bool): if True, resume from the last checkpoint if it exists.
-
-        Returns:
-            same as :meth:`load`.
-        """
-        if resume and self.has_checkpoint():
-            path = self.get_checkpoint_file()
-        return self.load(path)
-
-    def tag_last_checkpoint(self, last_filename_basename: str):
-        """
-        Tag the last checkpoint.
-
-        Args:
-            last_filename_basename (str): the basename of the last filename.
-        """
-        save_file = os.path.join(self.save_dir, "last_checkpoint")
-        with open(save_file, "w") as f:
-            f.write(last_filename_basename)
-
-    def _load_file(self, f: str):
-        """
-        Load a checkpoint file. Can be overwritten by subclasses to support
-        different formats.
-        Args:
-            f (str): a locally mounted file path.
-        Returns:
-            dict: with keys "model" and optionally others that are saved by
-                the checkpointer dict["model"] must be a dict which maps strings
-                to torch.Tensor or numpy arrays.
-        """
-        return torch.load(f, map_location=torch.device("cpu"))
-
-    def _load_model(self, checkpoint):
-        """
-        Load weights from a checkpoint.
-        Args:
-            checkpoint (Any): checkpoint contains the weights.
-        """
-        checkpoint_state_dict = checkpoint.pop("model")
-        self._convert_ndarray_to_tensor(checkpoint_state_dict)
-
-        # work around https://github.com/pytorch/pytorch/issues/24139
-        model_state_dict = self.model.state_dict()
-        for k in list(checkpoint_state_dict.keys()):
-            if k in model_state_dict:
-                shape_model = tuple(model_state_dict[k].shape)
-                shape_checkpoint = tuple(checkpoint_state_dict[k].shape)
-                if shape_model != shape_checkpoint:
-                    self.logger.warning(
-                        "'{}' has shape {} in the checkpoint but {} in the "
-                        "model! Skipped.".format(
-                            k, shape_checkpoint, shape_model
-                        )
-                    )
-                    checkpoint_state_dict.pop(k)
-
-        incompatible = self.model.load_state_dict(
-            checkpoint_state_dict, strict=False
-        )
-        if incompatible.missing_keys:
-            self.logger.info(
-                "Missing keys: {}".format(incompatible.missing_keys)
-            )
-        if incompatible.unexpected_keys:
-            self.logger.info(
-                "Unexpected keys: {}".format(incompatible.unexpected_keys)
-            )
-
-    def _convert_ndarray_to_tensor(self, state_dict: dict):
-        """
-        In-place convert all numpy arrays in the state_dict to torch tensor.
-        Args:
-            state_dict (dict): a state-dict to be loaded to the model.
-        """
-        # model could be an OrderedDict with _metadata attribute
-        # (as returned by Pytorch's state_dict()). We should preserve these
-        # properties.
-        for k in list(state_dict.keys()):
-            v = state_dict[k]
-            if not isinstance(v, np.ndarray) and not isinstance(
-                v, torch.Tensor
-            ):
-                raise ValueError(
-                    "Unsupported type found in checkpoint! {}: {}".format(
-                        k, type(v)
-                    )
-                )
-            if not isinstance(v, torch.Tensor):
-                state_dict[k] = torch.from_numpy(v)
-
-
-class DetectionCheckpointer(Checkpointer):
+def default_argument_parser():
     """
-    Same as :class:`Checkpointer`, but is able to handle models in detectron & detectron2
-    model zoo, and apply conversions for legacy models.
-    """
+    Create argument parser with default argument configurations
 
-    def __init__(self, model, save_dir="", *, save_to_disk=None, **checkpointables):
-        is_main_process = comm.is_main_process()
-        super().__init__(
-            model,
-            save_dir,
-            save_to_disk=is_main_process if save_to_disk is None else save_to_disk,
-            **checkpointables,
+    Returns:
+        argparse.ArgumentParser:
+    """
+    parser = argparse.ArgumentParser(description="Training")
+    parser.add_argument("--config-file", default="", metavar="FILE", help="path to config file")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="whether to attempt to resume from the checkpoint directory",
+    )
+    parser.add_argument("--eval-only", action="store_true", help="perform evaluation only")
+
+    parser.add_argument(
+        "opts",
+        help="Modify config options using the command-line",
+        default=None,
+        nargs=argparse.REMAINDER,
+    )
+    return parser
+
+
+def default_setup(cfg, args):
+    """
+    Perform some basic common setups at the beginning of a job, including:
+
+    1. Set up the detectron2 logger
+    2. Log basic information about environment, cmdline arguments, and config
+    3. Backup the config to the output directory
+
+    Args:
+        cfg (CfgNode): the full config to be used
+        args (argparse.NameSpace): the command line arguments to be logged
+    """
+    output_dir = cfg.OUTPUT_DIR
+    if comm.is_main_process() and output_dir:
+        PathManager.mkdirs(output_dir)
+
+    rank = comm.get_rank()
+    setup_logger(output_dir, distributed_rank=rank, name="fvcore")
+    logger = setup_logger(output_dir, distributed_rank=rank)
+
+    logger.info("Rank of current process: {}. World size: {}".format(rank, comm.get_world_size()))
+    logger.info("Environment info:\n" + collect_env_info())
+
+    logger.info("Command line arguments: " + str(args))
+    if hasattr(args, "config_file"):
+        logger.info(
+            "Contents of args.config_file={}:\n{}".format(
+                args.config_file, PathManager.open(args.config_file, "r").read()
+            )
         )
 
-    def _load_file(self, filename):
-        if filename.endswith(".pkl"):
-            with PathManager.open(filename, "rb") as f:
-                data = pickle.load(f, encoding="latin1")
-            if "model" in data and "__author__" in data:
-                # file is in Detectron2 model zoo format
-                self.logger.info("Reading a file from '{}'".format(data["__author__"]))
-                return data
-            else:
-                # assume file is from Caffe2 / Detectron1 model zoo
-                if "blobs" in data:
-                    # Detection models have "blobs", but ImageNet models don't
-                    data = data["blobs"]
-                data = {k: v for k, v in data.items() if not k.endswith("_momentum")}
-                return {"model": data, "__author__": "Caffe2", "matching_heuristics": True}
+    logger.info("Running with full config:\n{}".format(cfg))
+    if comm.is_main_process() and output_dir:
+        # Note: some of our scripts may expect the existence of
+        # config.yaml in output directory
+        path = os.path.join(output_dir, "config.yaml")
+        with PathManager.open(path, "w") as f:
+            f.write(cfg.dump())
+        logger.info("Full config saved to {}".format(os.path.abspath(path)))
 
-        loaded = super()._load_file(filename)  # load native pth checkpoint
-        if "model" not in loaded:
-            loaded = {"model": loaded}
-        return loaded
+    # make sure each worker has a different, yet deterministic seed if specified
+    seed_all_rng(None if cfg.SEED < 0 else cfg.SEED + rank)
 
-    def _load_model(self, checkpoint):
-        if checkpoint.get("matching_heuristics", False):
-            self._convert_ndarray_to_tensor(checkpoint["model"])
-            # convert weights by name-matching heuristics
-            model_state_dict = self.model.state_dict()
-            align_and_update_state_dicts(
-                model_state_dict,
-                checkpoint["model"],
-                c2_conversion=checkpoint.get("__author__", None) == "Caffe2",
-            )
-            checkpoint["model"] = model_state_dict
-        # for non-caffe2 models, use standard ways to load it
-        super()._load_model(checkpoint)
+    # cudnn benchmark has large overhead. It shouldn't be used considering the small size of
+    # typical validation set.
+    if not (hasattr(args, "eval_only") and args.eval_only):
+        torch.backends.cudnn.benchmark = cfg.CUDNN_BENCHMARK
+
 
 
 class DefaultTrainer(SimpleTrainer):
@@ -341,7 +155,8 @@ class DefaultTrainer(SimpleTrainer):
         self.scheduler = self.build_lr_scheduler(cfg, optimizer)
         # Assume no other objects need to be checkpointed.
         # We can later make it checkpoint the stateful hooks
-        self.checkpointer = DetectionCheckpointer(
+        # **************************************************************************
+        self.checkpointer = Checkpointer(
             # Assume you want to save checkpoints together with logs/statistics
             model,
             cfg.OUTPUT_DIR,
