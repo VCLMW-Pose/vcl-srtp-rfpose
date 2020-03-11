@@ -1,7 +1,11 @@
 from torch.utils.data import Dataset, DataLoader
 
 
-def build_dataset():
+def build_train_loader(cfg, mapper=None):
+    pass
+
+
+def build_test_loader(cfg, mapper=None):
     pass
 
 
