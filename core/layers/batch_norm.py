@@ -5,7 +5,7 @@ import torch.distributed as dist
 from torch import nn
 from torch.autograd.function import Function
 
-from detectron2.utils import comm
+from core.utils import comm
 
 from .wrappers import BatchNorm2d
 
