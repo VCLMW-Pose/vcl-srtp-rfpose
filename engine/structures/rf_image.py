@@ -1,0 +1,3 @@
+
+class RFImage(object):
+    pass
